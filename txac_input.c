@@ -1,6 +1,7 @@
 /*
-TXAC Encoder v3.1 - 32-bit Support
-- FFmpeg agora converte para 32-bit (pcm_s32le)
+TXAC Encoder v3.2 - Delta Encoding FIXED
+- Delta encoding corrigido para compatibilidade com player 2-stage
+- FFmpeg converte para 32-bit (pcm_s32le)
 - Suporte nativo para leitura de WAV 32-bit int
 - Mantém otimizações AVX2
 
@@ -17,16 +18,48 @@ Compilar:
 #include <pthread.h>
 #include <immintrin.h>
 
+// Retorna a distância (dist) se encontrar o valor, ou -1 se não encontrar na janela
+int find_next_match_avx2(const int32_t *deltas, int start, int limit, int32_t target) {
+    // Carrega o valor alvo em todas as 8 posições do registrador AVX
+    __m256i target_vec = _mm256_set1_epi32(target);
+    
+    // Processa em blocos de 8
+    int i = start;
+    for (; i <= limit - 8; i += 8) {
+        // Carrega 8 samples (unaligned para evitar segfaults de borda)
+        __m256i data = _mm256_loadu_si256((__m256i*)&deltas[i]);
+        
+        // Compara o alvo com os 8 samples simultaneamente
+        // Retorna 0xFFFFFFFF nos campos onde houver igualdade
+        __m256i cmp = _mm256_cmpeq_epi32(data, target_vec);
+        
+        // Cria uma máscara de bits a partir do resultado da comparação
+        int mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp));
+        
+        if (mask != 0) {
+            // Se mask != 0, pelo menos um dos 8 bateu. 
+            // Usamos __builtin_ctz (count trailing zeros) para achar o índice exato.
+            return i + __builtin_ctz(mask);
+        }
+    }
+
+    // Processa o restante (caso o limite não seja múltiplo de 8)
+    for (; i <= limit; i++) {
+        if (deltas[i] == target) return i;
+    }
+
+    return -1;
+}
+
 #define TXAC_MAGIC "TXAC"
-#define TXAC_VERSION 3
+#define TXAC_VERSION 4
 #define DB_REDUCTION 110.0
-#define MAX_CHANNELS 8
+#define MAX_CHANNELS 32
 #define GROWTH_FACTOR 2
 
-// Símbolos 4-bit
 const char simbolos[16] = {
-    '0','1','2','3','4','5','6','7','8','9',
-    ',', '^', '~', '(', ')', '-'
+    ',','-','1','2','3','4','5','6','7','8','9','0',
+    '^', '~', '(', ')'
 };
 
 typedef struct {
@@ -36,10 +69,10 @@ typedef struct {
 } Channel;
 
 typedef struct {
-    uint8_t *data;  // Dados 4-bit compactados
+    uint8_t *data;
     size_t byte_count;
     size_t capacity;
-    int high_nibble;  // -1 ou valor do nibble alto
+    int high_nibble;
 } Binary4BitBuffer;
 
 typedef struct {
@@ -57,8 +90,34 @@ typedef struct {
     int enable_loop_compression;
 } ThreadData;
 
+typedef struct {
+    uint8_t *data;
+    size_t byte_count;
+    size_t capacity;
+    uint8_t bit_buffer; // Acumula os bits temporariamente
+    int bit_count;      // Quantos bits já estão no buffer (0-7)
+} RiceBuffer;
+
+void write_bits(RiceBuffer *rb, uint32_t value, int count) {
+    for (int i = count - 1; i >= 0; i--) {
+        rb->bit_buffer <<= 1;
+        if ((value >> i) & 1) rb->bit_buffer |= 1;
+        rb->bit_count++;
+
+        if (rb->bit_count == 8) {
+            if (rb->byte_count >= rb->capacity) {
+                rb->capacity *= 2;
+                rb->data = realloc(rb->data, rb->capacity);
+            }
+            rb->data[rb->byte_count++] = rb->bit_buffer;
+            rb->bit_buffer = 0;
+            rb->bit_count = 0;
+        }
+    }
+}
+
 // ============================================================================
-// BUFFER 4-BIT DIRETO
+// BUFFER 4-BIT
 // ============================================================================
 
 void init_4bit_buffer(Binary4BitBuffer *buf) {
@@ -155,14 +214,44 @@ void ensure_channel_capacity(Channel *ch, size_t required) {
 }
 
 // ============================================================================
-// LEITURA DE ÁUDIO (MODIFICADO PARA 32 BITS)
+// DELTA ENCODING
+// ============================================================================
+
+void apply_delta_encoding(Channel *ch, int32_t **deltas, size_t *delta_count) {
+    if (ch->count == 0) {
+        *deltas = NULL;
+        *delta_count = 0;
+        return;
+    }
+    
+    *delta_count = ch->count;
+    *deltas = (int32_t*)malloc(ch->count * sizeof(int32_t));
+    if (!*deltas) {
+        fprintf(stderr, "Error allocating delta buffer\n");
+        exit(1);
+    }
+    
+    // Primeiro valor é absoluto
+    (*deltas)[0] = ch->samples[0];
+    
+    // Demais valores são deltas (diferença entre consecutivos)
+    for (size_t i = 1; i < ch->count; i++) {
+        (*deltas)[i] = ch->samples[i] - ch->samples[i - 1];
+    }
+    
+    // Debug: mostra primeiros deltas
+    if (ch->count >= 10) {
+        printf("   First deltas: %d, %d, %d, %d, %d...\n", 
+               (*deltas)[0], (*deltas)[1], (*deltas)[2], (*deltas)[3], (*deltas)[4]);
+    }
+}
+
+// ============================================================================
+// LEITURA DE ÁUDIO
 // ============================================================================
 
 int precisa_converter(const char *filename) {
-    const char *ext = strrchr(filename, '.');
-    if (!ext) return 1;
-    // Força conversão se não for WAV ou se quisermos garantir o formato correto
-    return 1; 
+    return 1;
 }
 
 int convert_to_wav_temp(const char *audio_file, char *temp_wav) {
@@ -171,7 +260,6 @@ int convert_to_wav_temp(const char *audio_file, char *temp_wav) {
     const char *formato = ext ? ext + 1 : "áudio";
     
     char cmd[2048];
-    // ALTERAÇÃO: Mudamos pcm_s16le para pcm_s32le (32-bit Signed Integer)
     sprintf(cmd, "ffmpeg -i \"%s\" -f wav -acodec pcm_s32le -rf64 never \"%s\" -y -loglevel error", 
             audio_file, temp_wav);
     
@@ -203,13 +291,10 @@ int ler_wav_multicanal(const char *arquivo, Channel channels[], TXACHeader *head
     printf("WAV Info: %d Hz, %d canais, %d bits\n", 
            header->sample_rate, header->channels, header->bits_per_sample);
 
-    // Procura chunk 'data'
     fseek(f, 12, SEEK_SET);
     uint8_t chunk_id[4];
     uint32_t chunk_size;
     int found = 0;
-    
-    printf("Searching for chunk 'data'...\n");
     
     while (fread(chunk_id, 1, 4, f) == 4) {
         fread(&chunk_size, 4, 1, f);
@@ -231,30 +316,20 @@ int ler_wav_multicanal(const char *arquivo, Channel channels[], TXACHeader *head
         return 0;
     }
 
-    // Inicializa canais
     for (int i = 0; i < header->channels; i++) {
         init_channel(&channels[i], 512 * 1024);
     }
 
-    // Fator de redução
     float fator_f = (float)pow(10.0, -DB_REDUCTION / 20.0);
 
-    // =========================================================
-    // LÓGICA DE LEITURA 32-BIT
-    // =========================================================
     if (header->bits_per_sample == 32) {
-        int32_t buffer[8 * MAX_CHANNELS]; // Buffer para ler blocos
+        int32_t buffer[8 * MAX_CHANNELS];
         size_t num_read;
         
         while ((num_read = fread(buffer, sizeof(int32_t), 8 * header->channels, f)) > 0) {
-            // Se leu um número quebrado de samples (fim do arquivo), ajusta loop
-            size_t total_samples = num_read; 
-            
-            for (size_t i = 0; i < total_samples; i++) {
+            for (size_t i = 0; i < num_read; i++) {
                 int ch = i % header->channels;
                 int32_t s32 = buffer[i];
-                
-                // Aplica redução de volume diretamente no int32
                 int32_t reduced = (int32_t)(s32 * fator_f);
                 
                 ensure_channel_capacity(&channels[ch], 1);
@@ -262,9 +337,6 @@ int ler_wav_multicanal(const char *arquivo, Channel channels[], TXACHeader *head
             }
         }
     }
-    // =========================================================
-    // FALLBACK PARA 16-BIT (Caso o usuário forneça um WAV antigo)
-    // =========================================================
     else if (header->bits_per_sample == 16) {
         int16_t buffer[8 * MAX_CHANNELS];
         size_t num_read;
@@ -273,7 +345,6 @@ int ler_wav_multicanal(const char *arquivo, Channel channels[], TXACHeader *head
             for (size_t i = 0; i < num_read; i++) {
                 int ch = i % header->channels;
                 int16_t s16 = buffer[i];
-                // Converte 16 -> 32 bit movendo para a parte alta
                 int32_t s32 = ((int32_t)s16) << 16;
                 int32_t reduced = (int32_t)(s32 * fator_f);
                 
@@ -282,7 +353,7 @@ int ler_wav_multicanal(const char *arquivo, Channel channels[], TXACHeader *head
             }
         }
     } else {
-        fprintf(stderr, "Error: Only 16-bit and 32-bit surported. File is %d-bit.\n", header->bits_per_sample);
+        fprintf(stderr, "Error: Only 16-bit and 32-bit supported. File is %d-bit.\n", header->bits_per_sample);
         fclose(f);
         return 0;
     }
@@ -294,101 +365,22 @@ int ler_wav_multicanal(const char *arquivo, Channel channels[], TXACHeader *head
 }
 
 // ============================================================================
-// SCANNER DE LOOP (COM AVX2)
+// COMPRESSÃO COM DELTA
 // ============================================================================
 
-typedef struct {
-    int64_t start_pos;
-    int64_t loop_size;
-    int is_consecutive; 
-} LoopInfo;
+void encode_rice_symbol(RiceBuffer *rb, uint8_t symbol, int k) {
+    uint32_t q = symbol >> k;          // Quociente
+    uint32_t r = symbol & ((1 << k) - 1); // Resto
 
-LoopInfo detectar_loop_robusto(Channel *ch) {
-    LoopInfo info = {-1, 0, 0};
-    if (ch->count < 44100) return info; 
-    
-    printf(" Analysing %zu samples with Scanner AVX2...\n", ch->count);
-
-    size_t signature_len = 15000;
-    if (signature_len > ch->count / 2) signature_len = ch->count / 10;
-    
-    size_t end_idx = ch->count - signature_len;
-    int32_t *signature = &ch->samples[end_idx];
-
-    size_t found_pos = 0;
-    int found = 0;
-
-    for (size_t i = end_idx - signature_len; i > signature_len; i -= 10) { 
-        if (ch->samples[i] == signature[0]) {
-            int match = 1;
-            size_t j = 1;
-
-            // --- OTIMIZAÇÃO AVX2 ---
-            while (j + 8 <= signature_len) {
-                __m256i v_audio = _mm256_loadu_si256((__m256i*)&ch->samples[i + j]);
-                __m256i v_sig   = _mm256_loadu_si256((__m256i*)&signature[j]);
-                __m256i v_cmp = _mm256_cmpeq_epi32(v_audio, v_sig);
-                int mask = _mm256_movemask_ps(_mm256_castsi256_ps(v_cmp));
-
-                if (mask != 0xFF) {
-                    match = 0;
-                    break;
-                }
-                j += 8;
-            }
-
-            if (match) {
-                for (; j < signature_len; j++) {
-                    if (ch->samples[i + j] != signature[j]) {
-                        match = 0;
-                        break;
-                    }
-                }
-            }
-            
-            if (match) {
-                found_pos = i;
-                found = 1;
-                break;
-            }
-        }
+    // Escreve Quociente em Unário (q uns seguido de um zero)
+    for (uint32_t i = 0; i < q; i++) {
+        write_bits(rb, 1, 1);
     }
+    write_bits(rb, 0, 1);
 
-    if (found) {
-        size_t loop_len = signature_len;
-        size_t cursor_a = found_pos;
-        size_t cursor_b = end_idx;
-        
-        while (cursor_a > 0 && cursor_b > found_pos) { 
-            if (ch->samples[cursor_a - 1] == ch->samples[cursor_b - 1]) {
-                cursor_a--;
-                cursor_b--;
-                loop_len++;
-            } else {
-                break; 
-            }
-        }
-        
-        printf("Loop detectected! Start: %zu, Size: %zu\n", cursor_b, loop_len);
-        
-        info.start_pos = cursor_b;
-        info.loop_size = loop_len;
-        
-        if (cursor_b + loop_len >= ch->count - 100) { 
-            info.is_consecutive = 1; 
-        } else {
-            info.is_consecutive = 0;
-        }
-        return info;
-    }
-
-    printf("No obvious loops found.\n");
-    return info;
-}
-
-// ============================================================================
-// COMPRESSÃO COM 4-BIT DIRETO
-// ============================================================================
+    // Escreve Resto em Binário (k bits)
+    write_bits(rb, r, k);
+} 
 
 void *compactar_canal_4bit_thread(void *arg) {
     ThreadData *td = (ThreadData*)arg;
@@ -397,74 +389,121 @@ void *compactar_canal_4bit_thread(void *arg) {
     
     init_4bit_buffer(out);
     
-    printf("  [Channel %d] Direct compression to 4 bits...\n", td->channel_id);
+    printf("  [Channel %d] Applying delta encoding...\n", td->channel_id);
     
-    LoopInfo loop_info = {-1, 0, 0};
-    if (td->enable_loop_compression) {
-        loop_info = detectar_loop_robusto(ch);
+    int32_t *deltas = NULL;
+    size_t delta_count = 0;
+    apply_delta_encoding(ch, &deltas, &delta_count);
+    
+    if (!deltas || delta_count == 0) {
+        printf("  [Channel %d] Error: no deltas generated\n", td->channel_id);
+        return NULL;
     }
     
-    size_t end_pos = (loop_info.start_pos > 0) ? loop_info.start_pos : ch->count;
+    printf("  [Channel %d] Compressing %zu deltas to 4-bit...\n", td->channel_id, delta_count);
+    
     char temp[128];
     size_t i = 0;
     
-    while (i < end_pos) {
-        int32_t atual = ch->samples[i];
+while (i < delta_count) {
+        int32_t atual = deltas[i];
+        char temp[128];
         
-        // 1. Tenta ^
+        // 1. Tenta repetição IMEDIATA (^)
         size_t count = 1;
-        while (i + count < end_pos && ch->samples[i + count] == atual) {
+        while (i + count < delta_count && deltas[i + count] == atual) {
             count++;
         }
-        
+
         if (count >= 2) {
             sprintf(temp, "%d^%zu,", atual, count);
             write_string_4bit(out, temp);
             i += count;
             continue;
         }
-        
-        // 2. Tenta ~
+
+        // 2. Tenta Sniper (~) com Look-ahead de 100 samples usando AVX2
         int sniper_found = 0;
-        for (int dist = 2; dist <= 99 && i + dist < end_pos; dist++) {
-            if (ch->samples[i + dist] == atual) {
+        int janela = 100; // O "100 à frente" que você pediu
+        int limite_busca = (i + janela < delta_count) ? i + janela : delta_count - 1;
+
+        // Procura a primeira aparição do valor 'atual' no futuro próximo (mínimo dist 2)
+        int found_idx = find_next_match_avx2(deltas, i + 2, limite_busca, atual);
+
+        if (found_idx != -1) {
+            int dist = found_idx - i;
+            
+            // --- CHECAGEM DE EFICIÊNCIA ---
+            // Verificamos se dentro desse "buraco" do sniper existe alguma repetição (^)
+            // Se existir, é melhor NÃO usar o sniper agora para não quebrar a repetição futura.
+            int rep_no_caminho = 0;
+            for (int j = i + 1; j < found_idx - 1; j++) {
+                if (deltas[j] == deltas[j + 1]) {
+                    rep_no_caminho = 1;
+                    break;
+                }
+            }
+
+            if (!rep_no_caminho) {
+                // Aplica o Sniper: Valor~Distancia,
                 sprintf(temp, "%d~%d,", atual, dist - 1);
                 write_string_4bit(out, temp);
                 
-                for (int j = i + 1; j < i + dist; j++) {
-                    sprintf(temp, "%d,", ch->samples[j]);
+                // Escreve os valores que ficaram no meio
+                for (int j = i + 1; j < found_idx; j++) {
+                    sprintf(temp, "%d,", deltas[j]);
                     write_string_4bit(out, temp);
                 }
                 
-                i = i + dist + 1;
+                i = found_idx + 1; // Pula para depois do valor encontrado
                 sniper_found = 1;
-                break;
             }
         }
-        
+
+        // 3. Fallback: Se nada funcionou, escreve o valor simples
         if (!sniper_found) {
             sprintf(temp, "%d,", atual);
             write_string_4bit(out, temp);
             i++;
         }
     }
-    
-    if (loop_info.start_pos > 0) {
-        if (loop_info.is_consecutive) {
-            sprintf(temp, "LOOP^%lld,", loop_info.loop_size);
-            write_string_4bit(out, temp);
-        } else {
-            sprintf(temp, "LOOP~%lld,", loop_info.start_pos);
-            write_string_4bit(out, temp);
-        }
-    }
-    
-    finalize_4bit_buffer(out);
+        finalize_4bit_buffer(out);
 
-     printf("  [Channel %d] Compressed: %zu bytes (4-bit)\n", td->channel_id, out->byte_count);
+        // --- NOVA ETAPA: RICE ENCODING ---
+RiceBuffer rice_out;
+rice_out.capacity = out->byte_count; // Estimativa inicial
+rice_out.data = malloc(rice_out.capacity);
+rice_out.byte_count = 0;
+rice_out.bit_buffer = 0;
+rice_out.bit_count = 0;
 
-    return NULL;
+printf("  [Channel %d] Starting Rice Encoding step...\n", td->channel_id);
+
+for (size_t b = 0; b < out->byte_count; b++) {
+    // Pega os dois nibbles (símbolos de 4 bits) de volta
+    uint8_t high = out->data[b] >> 4;
+    uint8_t low = out->data[b] & 0x0F;
+
+    encode_rice_symbol(&rice_out, high, 1); // k=2 é um bom ponto de partida
+    encode_rice_symbol(&rice_out, low, 1);
 }
+
+// Finaliza o último byte se houver bits sobrando
+if (rice_out.bit_count > 0) {
+    rice_out.bit_buffer <<= (8 - rice_out.bit_count);
+    rice_out.data[rice_out.byte_count++] = rice_out.bit_buffer;
+}
+
+// Substitui o buffer de saída original pelo comprimido com Rice
+free(out->data);
+out->data = rice_out.data;
+out->byte_count = rice_out.byte_count;
+    
+    printf("  [Channel %d] Compressed: %zu bytes (4-bit delta + rice)\n", td->channel_id, out->byte_count);
+    
+    free(deltas);
+    return NULL;
+}  
 
 // ============================================================================
 // MAIN
@@ -472,7 +511,7 @@ void *compactar_canal_4bit_thread(void *arg) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        printf("Usage: %s <input> <output.txac> [--loop]\n", argv[0]);
+        printf("\nUsage: %s <input> <output.txac> [--loop]\n", argv[0]);
         return 1;
     }
 
@@ -480,12 +519,11 @@ int main(int argc, char **argv) {
     const char *output = argv[2];
     int enable_loop = (argc >= 4 && strcmp(argv[3], "--loop") == 0);
 
-    printf("\n=== TXAC input v0.2.0 ===\n");
+    printf("\n=== TXAC Encoder v0.3.0 (Delta Encoding) ===\n");
 
     char temp_wav[256] = {0};
     int is_temp = 0;
 
-    // Sempre tenta converter para garantir 32-bit se não for um WAV confiável
     if (precisa_converter(input)) {
         if (!convert_to_wav_temp(input, temp_wav)) return 1;
         input = temp_wav;
@@ -500,7 +538,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("\nCompressing %d channels...\n", header.channels);
+    printf("\nCompressing %d channels with delta encoding...\n", header.channels);
     
     pthread_t threads[MAX_CHANNELS];
     ThreadData thread_data[MAX_CHANNELS];
@@ -519,7 +557,7 @@ int main(int argc, char **argv) {
         pthread_join(threads[i], NULL);
     }
 
-    printf("\nSaving container TXAC v0.2.0...\n");
+    printf("\nSaving TXAC file...\n");
     FILE *fout = fopen(output, "wb");
     if (!fout) {
         perror("Error creating file");
@@ -532,11 +570,11 @@ int main(int argc, char **argv) {
     fwrite(&header.sample_rate, 4, 1, fout);
     fwrite(&header.channels, 2, 1, fout);
     
-    // Agora salvamos como 32 bits no cabeçalho
-    uint16_t save_bits = 32; 
+    uint16_t save_bits = 32;
     fwrite(&save_bits, 2, 1, fout);
     
     uint32_t flags = enable_loop ? 1 : 0;
+    flags |= (1 << 1); // Delta encoding flag
     fwrite(&flags, 4, 1, fout);
     fwrite(&header.total_samples, 8, 1, fout);
     
@@ -564,23 +602,17 @@ int main(int argc, char **argv) {
         fwrite(&sizes[i], 8, 1, fout);
     }
 
-    // Dados dos canais (já em 4-bit!)
-    for (int i = 0; i < header.channels; i++) {
-        offsets[i] = ftell(fout);
-        fwrite(outputs[i].data, 1, outputs[i].byte_count, fout);
-        sizes[i] = outputs[i].byte_count;
-        printf("  Channel %d: %llu bytes\n", i, sizes[i]);
-    }
-
-
     fclose(fout);
 
+    printf("\nChannel compression results:\n");
     for (int i = 0; i < header.channels; i++) {
+        printf("  Channel %d: %llu bytes\n", i, sizes[i]);
         free(channels[i].samples);
         free(outputs[i].data);
     }
+    
     if (is_temp) remove(temp_wav);
 
-    printf("\nCoding complete!\n");
+    printf("\nEncoding complete!\n");
     return 0;
 }

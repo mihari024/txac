@@ -13,8 +13,8 @@ TXAC Player v14.0 - 14-bit Packed Buffer + On-the-fly Float Conversion
 #include <math.h>
 #include <immintrin.h>
 
-#define SOKOL_AUDIO_IMPL
-#include "sokol_audio.h"
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
 
 
 #if defined(_WIN32)
@@ -463,26 +463,27 @@ double calculate_duration(txacplay_desc *tp) {
 // Nenhum float é armazenado na RAM; a conversão acontece amostra a amostra
 // enquanto o sokol consome o buffer de saída.
 // ============================================================================
-void audio_cb(float *buffer, int num_frames, int num_channels, void *user_data) {
-    txacplay_desc *tp = (txacplay_desc*)user_data;
+void audio_cb(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    txacplay_desc *tp = (txacplay_desc*)pDevice->pUserData;
+    float *buffer = (float*)pOutput;
+    int num_channels = pDevice->playback.channels;
     
     if (tp->is_paused || !tp->running || !tp->pcm_data_14bit) {
-        memset(buffer, 0, num_frames * num_channels * sizeof(float));
+        memset(buffer, 0, frameCount * num_channels * sizeof(float));
         return;
     }
     
-    int   total_samples = num_frames * num_channels;
-    float cf            = tp->conversion_factor;  // fator pré-calculado: pow(10, dB/20) / 2^31
+    int total_samples = frameCount * num_channels;
+    float cf = tp->conversion_factor;
     
     for (int i = 0; i < total_samples; i++) {
         if (tp->playback_cursor >= tp->total_samples) tp->playback_cursor = 0;
 
-        // unpack14: lê inteiro signed 14-bit → int32
-        // Multiplicação por cf: normaliza para -1.0..1.0 com amplificação DB
-        // O float resultante NUNCA é armazenado fora deste loop (fica no buffer do sokol)
+        // Conversão 14-bit -> float ao vivo
         buffer[i] = (float)unpack14(tp->pcm_data_14bit, tp->playback_cursor++) * cf;
     }
 
+    // Opcional: Atualizar timer no console (pode causar jitter em modo exclusivo, use com moderação)
     printf("\r%.2f / %.2f sec", calculate_time(tp), calculate_duration(tp));
     fflush(stdout);
 }
@@ -606,13 +607,35 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    saudio_setup(&(saudio_desc){
-        .sample_rate        = tp->header.sample_rate,
-        .num_channels       = tp->header.channels,
-        .stream_userdata_cb = audio_cb,
-        .user_data          = tp,
-        .buffer_frames      = 4096
-    });
+    // Configuração do dispositivo de áudio
+    ma_device_config config = ma_device_config_init(ma_device_type_playback);
+    config.playback.format   = ma_format_f32;   // Seu player trabalha com floats convertidos
+    config.playback.channels = tp->header.channels;
+    config.sampleRate        = tp->header.sample_rate;
+    config.dataCallback      = audio_cb;
+    config.pUserData         = tp;
+    
+    // ATIVAÇÃO DO MODO EXCLUSIVO (WASAPI)
+    config.playback.shareMode = ma_share_mode_exclusive;
+    // Período de buffer menor para aproveitar a baixa latência do modo exclusivo
+    config.periodSizeInFrames = 1024; 
+
+    ma_device device;
+    if (ma_device_init(NULL, &config, &device) != MA_SUCCESS) {
+        printf("Critical error: Could not open audio in EXCLUSIVE mode.\n");
+        printf("Verify if the sample rate %u Hz is supported by the hardware or if another application is using the sound card.\n", tp->header.sample_rate);
+        txacplay_close(tp);
+        return 1;
+    }
+
+    if (ma_device_start(&device) != MA_SUCCESS) {
+        printf("Error starting playback device.\n");
+        ma_device_uninit(&device);
+        txacplay_close(tp);
+        return 1;
+    }
+    
+    printf("Playing in WASAPI EXCLUSIVE MODE...\n");
     
     printf("Playing...\n Press:\n [space] to pause\n [x] to go back 5s\n [c] to go forward 5s\n [q] to exit\n\n");
     
@@ -642,7 +665,7 @@ int main(int argc, char **argv) {
         update_timer(tp);
     }
     
-    saudio_shutdown();
+    ma_device_uninit(&device);
     txacplay_close(tp);
     printf("\n\nBye bye\n");
     return 0;
