@@ -58,8 +58,7 @@ typedef struct {
 } BufferInt32;
 
 static void init_buffer_int32(BufferInt32 *buf, uint64_t initial_capacity) {
-    buf->capacity = initial_capacity * 4;
-    if (buf->capacity < 10000000) buf->capacity = 10000000;
+    buf->capacity = initial_capacity ? initial_capacity : 1024;
     buf->count = 0;
     buf->data = (int32_t *)malloc(buf->capacity * sizeof(int32_t));
     if (!buf->data) {
@@ -146,13 +145,49 @@ static char read_next_char(Stream4Bit *s) {
     return simbolos[sym];
 }
 
-static void read_token_stream(Stream4Bit *s, char *buffer, size_t max_len) {
-    size_t idx = 0;
+typedef struct {
+    int32_t  value;
+    uint32_t argument;
+    char     operation;
+} ParsedToken;
+
+/* Analisa diretamente o fluxo de texto lógico do TXAC, sem criar uma string C
+ * temporária nem chamar o mecanismo de scanf dependente de localidade. */
+static int read_token_stream(Stream4Bit *s, ParsedToken *token) {
+    uint64_t value = 0;
+    uint64_t argument = 0;
+    int negative = 0;
+    int have_value = 0;
+    int have_argument = 0;
+    char operation = '\0';
     char c;
+
     while ((c = read_next_char(s)) != '\0' && c != ',') {
-        if (idx < max_len - 1) buffer[idx++] = c;
+        if (c == '(' || c == ')') continue;
+        if (!have_value && c == '-') {
+            negative = 1;
+        } else if (c >= '0' && c <= '9') {
+            uint64_t *destination = operation ? &argument : &value;
+            *destination = *destination * 10 + (uint64_t)(c - '0');
+            if (operation) have_argument = 1;
+            else have_value = 1;
+        } else if ((c == '^' || c == '~') && have_value && !operation) {
+            operation = c;
+        } else {
+            return -1;
+        }
     }
-    buffer[idx] = '\0';
+
+    if (!have_value) return 0;
+    if (operation && !have_argument) return -1;
+    if ((!negative && value > INT32_MAX_VAL) ||
+        (negative && value > UINT64_C(2147483648)) ||
+        argument > UINT32_MAX) return -1;
+
+    token->value = negative ? (int32_t)(-(int64_t)value) : (int32_t)value;
+    token->argument = (uint32_t)argument;
+    token->operation = operation;
+    return 1;
 }
 
 /* ============================================================================
@@ -185,22 +220,19 @@ static void process_stream_to_int32(ChannelDecoder *dec, Stream4Bit *stream,
                                     int32_t *accumulator) {
     if (recursion_depth > 100) return;
 
-    char token[128];
-
     while (stream->bit_pos < stream->byte_count * 8) {
-        read_token_stream(stream, token, sizeof(token));
+        ParsedToken token;
+        int token_status = read_token_stream(stream, &token);
+        if (token_status <= 0) break;
 
-        if (token[0] == '\0') break;
-        if (token[0] == '(' || token[0] == ')') continue;
-
-        double  num_d;
-        int     rep;
+        uint32_t rep;
         int32_t delta;
         int32_t out;
 
         /* --- Caso 1: Repetição  valor^N ---------------------------------- */
-        if (sscanf(token, "%lf^%d", &num_d, &rep) == 2) {
-            delta = (int32_t)num_d;
+        if (token.operation == '^') {
+            delta = token.value;
+            rep = token.argument;
             ensure_buffer_capacity(dec->output_buffer, (uint64_t)rep);
 
             if (!dec->use_delta_encoding || delta == 0) {
@@ -213,28 +245,28 @@ static void process_stream_to_int32(ChannelDecoder *dec, Stream4Bit *stream,
 
                 if (rep >= 8) {
                     __m256i vv = _mm256_set1_epi32(out);
-                    int blocks = rep / 8;
-                    for (int i = 0; i < blocks; i++) {
+                    uint32_t blocks = rep / 8;
+                    for (uint32_t i = 0; i < blocks; i++) {
                         _mm256_storeu_si256(
                             (__m256i *)&dec->output_buffer->data[dec->output_buffer->count],
                             vv);
                         dec->output_buffer->count += 8;
                         *sample_idx += 8;
                     }
-                    int rem = rep % 8;
-                    for (int i = 0; i < rem; i++) {
+                    uint32_t rem = rep % 8;
+                    for (uint32_t i = 0; i < rem; i++) {
                         dec->output_buffer->data[dec->output_buffer->count++] = out;
                         (*sample_idx)++;
                     }
                 } else {
-                    for (int i = 0; i < rep; i++) {
+                    for (uint32_t i = 0; i < rep; i++) {
                         dec->output_buffer->data[dec->output_buffer->count++] = out;
                         (*sample_idx)++;
                     }
                 }
             } else {
                 /* Delta != 0: cada sample acumula valor diferente */
-                for (int i = 0; i < rep; i++) {
+                for (uint32_t i = 0; i < rep; i++) {
                     *accumulator += delta;
                     out = apply_gain_and_clip((double)*accumulator);
                     dec->output_buffer->data[dec->output_buffer->count++] = out;
@@ -245,8 +277,9 @@ static void process_stream_to_int32(ChannelDecoder *dec, Stream4Bit *stream,
             if (recursion_depth > 0) return;
         }
         /* --- Caso 2: Sniper  valor~N ------------------------------------- */
-        else if (sscanf(token, "%lf~%d", &num_d, &rep) == 2) {
-            delta = (int32_t)num_d;
+        else if (token.operation == '~') {
+            delta = token.value;
+            rep = token.argument;
 
             if (dec->use_delta_encoding) *accumulator += delta;
             else                          *accumulator  = delta;
@@ -255,7 +288,7 @@ static void process_stream_to_int32(ChannelDecoder *dec, Stream4Bit *stream,
             push_value_int32(dec->output_buffer, out);
             (*sample_idx)++;
 
-            for (int i = 0; i < rep; i++) {
+            for (uint32_t i = 0; i < rep; i++) {
                 process_stream_to_int32(dec, stream, sample_idx,
                                         recursion_depth + 1, accumulator);
             }
@@ -271,8 +304,8 @@ static void process_stream_to_int32(ChannelDecoder *dec, Stream4Bit *stream,
             if (recursion_depth > 0) return;
         }
         /* --- Caso 3: Valor simples --------------------------------------- */
-        else if (sscanf(token, "%lf", &num_d) == 1) {
-            delta = (int32_t)num_d;
+        else if (token.operation == '\0') {
+            delta = token.value;
 
             if (dec->use_delta_encoding) {
                 /* Primeiro sample inicializa; demais acumulam */
@@ -414,7 +447,6 @@ int main(int argc, char **argv) {
     fread(&hdr.total_samples,   8, 1, f);
 
     /* Flags — iguais ao txacplay */
-    int loop_enabled = (hdr.flags & (1 << 0)) != 0;
     int use_delta    = (hdr.flags & (1 << 1)) != 0;
 
     printf(" TXAC Info:\n");
@@ -455,9 +487,7 @@ int main(int argc, char **argv) {
            hdr.channels, hdr.channels == 1 ? "" : "s");
 
     for (int i = 0; i < (int)hdr.channels; i++) {
-        uint64_t per_ch = hdr.total_samples > 0
-                          ? hdr.total_samples / hdr.channels
-                          : 1000000;
+        uint64_t per_ch = hdr.total_samples > 0 ? hdr.total_samples : 1024;
         init_buffer_int32(&cbufs[i], per_ch);
 
         decoders[i].channel_id         = i;

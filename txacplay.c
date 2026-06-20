@@ -124,10 +124,7 @@ static inline uint64_t bytes_for_14bit(uint64_t samples) {
 }
 
 void init_buffer_14bit(Buffer14Bit *buf, uint64_t initial_capacity) {
-    buf->capacity = initial_capacity * 4;
-    if (buf->capacity < 10000000) {
-        buf->capacity = 10000000;
-    }
+    buf->capacity = initial_capacity ? initial_capacity : 1024;
     buf->count = 0;
     // +4 bytes de margem para que unpack14 nunca leia fora do buffer no último sample
     buf->data = (uint8_t*)calloc(bytes_for_14bit(buf->capacity) + 4, 1);
@@ -267,16 +264,48 @@ char read_next_char(Stream4Bit *s) {
     return simbolos[symbol_idx];
 }
 
-void read_token_stream(Stream4Bit *s, char *buffer, size_t max_len) {
-    size_t idx = 0;
+typedef struct {
+    int32_t value;
+    uint32_t argument;
+    char operation;
+} ParsedToken;
+
+/* Analisa o texto lógico diretamente, sem string temporária nem sscanf. */
+static int read_token_stream(Stream4Bit *s, ParsedToken *token) {
+    uint64_t value = 0;
+    uint64_t argument = 0;
+    int negative = 0;
+    int have_value = 0;
+    int have_argument = 0;
+    char operation = '\0';
     char c;
-    
+
     while ((c = read_next_char(s)) != '\0' && c != ',') {
-        if (idx < max_len - 1) {
-            buffer[idx++] = c;
+        if (c == '(' || c == ')') continue;
+        if (!have_value && c == '-') {
+            negative = 1;
+        } else if (c >= '0' && c <= '9') {
+            uint64_t *destination = operation ? &argument : &value;
+            *destination = *destination * 10 + (uint64_t)(c - '0');
+            if (operation) have_argument = 1;
+            else have_value = 1;
+        } else if ((c == '^' || c == '~') && have_value && !operation) {
+            operation = c;
+        } else {
+            return -1;
         }
     }
-    buffer[idx] = '\0';
+
+    if (!have_value) return 0;
+    if (operation && !have_argument) return -1;
+    if ((!negative && value > INT32_MAX) ||
+        (negative && value > UINT64_C(2147483648)) ||
+        argument > UINT32_MAX) return -1;
+
+    token->value = negative ? (int32_t)(-(int64_t)value) : (int32_t)value;
+    token->argument = (uint32_t)argument;
+    token->operation = operation;
+    return 1;
 }
 
 // ============================================================================
@@ -298,27 +327,23 @@ void process_stream_to_14bit(ChannelLoader *ldr, Stream4Bit *stream, uint64_t *s
                               int recursion_depth, int32_t *accumulator) {
     if (recursion_depth > 100) return;
     
-    char token[64];
-    
     // CORREÇÃO: Usamos bit_pos para verificar o fim do stream
     // Multiplicamos byte_count por 8 para ter o total de bits
     while (stream->bit_pos < (stream->byte_count * 8)) {
-        read_token_stream(stream, token, 64);
-        
-        // Se o token vier vazio (fim do stream), saímos do loop
-        if (token[0] == '\0') break;
-        if (token[0] == '(' || token[0] == ')') continue;
-        
-        double  num_d;
-        int     rep;
+        ParsedToken token;
+        int token_status = read_token_stream(stream, &token);
+        if (token_status <= 0) break;
+
+        uint32_t rep;
         int32_t delta_value;
         
         // Caso 1: Repetição (valor^repeticoes)
-        if (sscanf(token, "%lf^%d", &num_d, &rep) == 2) {
-            delta_value = (int32_t)num_d;
+        if (token.operation == '^') {
+            delta_value = token.value;
+            rep = token.argument;
             
             ensure_buffer_capacity_14bit(ldr->output_buffer, rep);
-            for (int i = 0; i < rep; i++) {
+            for (uint32_t i = 0; i < rep; i++) {
                 if (ldr->use_delta_encoding) {
                     *accumulator += delta_value;
                     pack14(ldr->output_buffer->data, ldr->output_buffer->count++, *accumulator);
@@ -330,8 +355,9 @@ void process_stream_to_14bit(ChannelLoader *ldr, Stream4Bit *stream, uint64_t *s
             if (recursion_depth > 0) return;
         }
         // Caso 2: Sniper/Loop (valor~distancia)
-        else if (sscanf(token, "%lf~%d", &num_d, &rep) == 2) {
-            delta_value = (int32_t)num_d;
+        else if (token.operation == '~') {
+            delta_value = token.value;
+            rep = token.argument;
             
             if (ldr->use_delta_encoding) *accumulator += delta_value;
             else                         *accumulator  = delta_value;
@@ -339,7 +365,7 @@ void process_stream_to_14bit(ChannelLoader *ldr, Stream4Bit *stream, uint64_t *s
             push_value_14bit(ldr->output_buffer, *accumulator);
             (*sample_idx)++;
             
-            for (int i = 0; i < rep; i++) {
+            for (uint32_t i = 0; i < rep; i++) {
                 process_stream_to_14bit(ldr, stream, sample_idx, recursion_depth + 1, accumulator);
             }
             
@@ -351,8 +377,8 @@ void process_stream_to_14bit(ChannelLoader *ldr, Stream4Bit *stream, uint64_t *s
             if (recursion_depth > 0) return;
         }
         // Caso 3: Valor simples
-        else if (sscanf(token, "%lf", &num_d) == 1) {
-            delta_value = (int32_t)num_d;
+        else if (token.operation == '\0') {
+            delta_value = token.value;
             
             if (ldr->use_delta_encoding) {
                 if (*sample_idx == 0) *accumulator  = delta_value;
@@ -483,8 +509,6 @@ void audio_cb(float *buffer, int num_frames, int num_channels, void *user_data) 
         buffer[i] = (float)unpack14(tp->pcm_data_14bit, tp->playback_cursor++) * cf;
     }
 
-    printf("\r%.2f / %.2f sec", calculate_time(tp), calculate_duration(tp));
-    fflush(stdout);
 }
 
 void toggle_pause(txacplay_desc *tp) {
@@ -555,7 +579,7 @@ txacplay_desc *txacplay_open(const char *path) {
     // Inicia threads que fazem parsing direto 4bit → 14bit
     for (int i = 0; i < tp->header.channels; i++) {
         init_buffer_14bit(&tp->channel_buffers[i],
-                          tp->header.total_samples / tp->header.channels);
+                          tp->header.total_samples);
         
         tp->loaders[i].channel_id        = i;
         tp->loaders[i].output_buffer     = &tp->channel_buffers[i];

@@ -72,7 +72,6 @@ typedef struct {
     uint8_t *data;
     size_t byte_count;
     size_t capacity;
-    int high_nibble;
 } Binary4BitBuffer;
 
 typedef struct {
@@ -91,42 +90,21 @@ typedef struct {
 } ThreadData;
 
 typedef struct {
-    uint8_t *data;
-    size_t byte_count;
-    size_t capacity;
-    uint8_t bit_buffer; // Acumula os bits temporariamente
-    int bit_count;      // Quantos bits já estão no buffer (0-7)
+    Binary4BitBuffer *output;
+    uint64_t bits;
+    unsigned bit_count;
 } RiceBuffer;
 
-void write_bits(RiceBuffer *rb, uint32_t value, int count) {
-    for (int i = count - 1; i >= 0; i--) {
-        rb->bit_buffer <<= 1;
-        if ((value >> i) & 1) rb->bit_buffer |= 1;
-        rb->bit_count++;
-
-        if (rb->bit_count == 8) {
-            if (rb->byte_count >= rb->capacity) {
-                rb->capacity *= 2;
-                rb->data = realloc(rb->data, rb->capacity);
-            }
-            rb->data[rb->byte_count++] = rb->bit_buffer;
-            rb->bit_buffer = 0;
-            rb->bit_count = 0;
-        }
-    }
-}
-
 // ============================================================================
-// BUFFER 4-BIT
+// BUFFER + ESCRITA DIRETA DE SÍMBOLOS DE TEXTO EM RICE
 // ============================================================================
 
 void init_4bit_buffer(Binary4BitBuffer *buf) {
     buf->capacity = 1024 * 1024;
     buf->byte_count = 0;
     buf->data = (uint8_t*)malloc(buf->capacity);
-    buf->high_nibble = -1;
     if (!buf->data) {
-        fprintf(stderr, "Error allocating 4-bit buffer.\n");
+        fprintf(stderr, "Error allocating output buffer.\n");
         exit(1);
     }
 }
@@ -139,7 +117,7 @@ void ensure_4bit_capacity(Binary4BitBuffer *buf, size_t required_bytes) {
         }
         uint8_t *new_ptr = (uint8_t*)realloc(buf->data, new_cap);
         if (!new_ptr) {
-            fprintf(stderr, "Error reallocating 4-bit buffer.\n");
+            fprintf(stderr, "Error reallocating output buffer.\n");
             exit(1);
         }
         buf->data = new_ptr;
@@ -147,39 +125,87 @@ void ensure_4bit_capacity(Binary4BitBuffer *buf, size_t required_bytes) {
     }
 }
 
-int char_para_4bit(char c) {
-    for (int i = 0; i < 16; i++) {
-        if (simbolos[i] == c) return i;
-    }
-    return -1;
+/* Os valores são símbolo+1; entradas zeradas continuam inválidas. */
+static const uint8_t char_to_symbol[256] = {
+    [','] = 1, ['-'] = 2,
+    ['1'] = 3, ['2'] = 4, ['3'] = 5, ['4'] = 6, ['5'] = 7,
+    ['6'] = 8, ['7'] = 9, ['8'] = 10, ['9'] = 11, ['0'] = 12,
+    ['^'] = 13, ['~'] = 14, ['('] = 15, [')'] = 16
+};
+
+/* Códigos Rice(k=1) dos símbolos 0..15, alinhados à direita. */
+static const uint16_t rice_code[16] = {
+    0x000, 0x001, 0x004, 0x005, 0x00C, 0x00D, 0x01C, 0x01D,
+    0x03C, 0x03D, 0x07C, 0x07D, 0x0FC, 0x0FD, 0x1FC, 0x1FD
+};
+static const uint8_t rice_code_len[16] = {
+    2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9
+};
+
+static inline void rice_writer_init(RiceBuffer *rb, Binary4BitBuffer *output) {
+    rb->output = output;
+    rb->bits = 0;
+    rb->bit_count = 0;
 }
 
-void write_char_4bit(Binary4BitBuffer *buf, char c) {
-    int nibble = char_para_4bit(c);
-    if (nibble == -1) return;
-    
-    if (buf->high_nibble == -1) {
-        buf->high_nibble = nibble;
+static inline void rice_write_symbol(RiceBuffer *rb, uint8_t symbol) {
+    unsigned len = rice_code_len[symbol];
+    rb->bits = (rb->bits << len) | rice_code[symbol];
+    rb->bit_count += len;
+
+    while (rb->bit_count >= 8) {
+        rb->bit_count -= 8;
+        ensure_4bit_capacity(rb->output, 1);
+        rb->output->data[rb->output->byte_count++] =
+            (uint8_t)(rb->bits >> rb->bit_count);
+        if (rb->bit_count == 0) rb->bits = 0;
+        else rb->bits &= (UINT64_C(1) << rb->bit_count) - 1;
+    }
+}
+
+static inline void rice_write_char(RiceBuffer *rb, char c) {
+    uint8_t encoded = char_to_symbol[(uint8_t)c];
+    if (encoded != 0) rice_write_symbol(rb, (uint8_t)(encoded - 1));
+}
+
+static void rice_write_u64(RiceBuffer *rb, uint64_t value) {
+    char digits[20];
+    unsigned count = 0;
+    do {
+        digits[count++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    while (count != 0) rice_write_char(rb, digits[--count]);
+}
+
+static void rice_write_i32(RiceBuffer *rb, int32_t value) {
+    uint64_t magnitude;
+    if (value < 0) {
+        rice_write_char(rb, '-');
+        magnitude = (uint64_t)(-(int64_t)value);
     } else {
-        ensure_4bit_capacity(buf, 1);
-        uint8_t byte = (buf->high_nibble << 4) | nibble;
-        buf->data[buf->byte_count++] = byte;
-        buf->high_nibble = -1;
+        magnitude = (uint32_t)value;
     }
+    rice_write_u64(rb, magnitude);
 }
 
-void write_string_4bit(Binary4BitBuffer *buf, const char *str) {
-    for (size_t i = 0; str[i] != '\0'; i++) {
-        write_char_4bit(buf, str[i]);
+static inline void rice_write_token(RiceBuffer *rb, int32_t value,
+                                    char operation, uint64_t argument) {
+    rice_write_i32(rb, value);
+    if (operation != '\0') {
+        rice_write_char(rb, operation);
+        rice_write_u64(rb, argument);
     }
+    rice_write_char(rb, ',');
 }
 
-void finalize_4bit_buffer(Binary4BitBuffer *buf) {
-    if (buf->high_nibble != -1) {
-        ensure_4bit_capacity(buf, 1);
-        uint8_t byte = (buf->high_nibble << 4);
-        buf->data[buf->byte_count++] = byte;
-        buf->high_nibble = -1;
+static void rice_writer_finish(RiceBuffer *rb) {
+    if (rb->bit_count != 0) {
+        ensure_4bit_capacity(rb->output, 1);
+        rb->output->data[rb->output->byte_count++] =
+            (uint8_t)(rb->bits << (8 - rb->bit_count));
+        rb->bits = 0;
+        rb->bit_count = 0;
     }
 }
 
@@ -251,7 +277,12 @@ void apply_delta_encoding(Channel *ch, int32_t **deltas, size_t *delta_count) {
 // ============================================================================
 
 int precisa_converter(const char *filename) {
-    return 1;
+    const char *ext = strrchr(filename, '.');
+    return !ext ||
+           !((ext[1] == 'w' || ext[1] == 'W') &&
+             (ext[2] == 'a' || ext[2] == 'A') &&
+             (ext[3] == 'v' || ext[3] == 'V') &&
+              ext[4] == '\0');
 }
 
 int convert_to_wav_temp(const char *audio_file, char *temp_wav) {
@@ -316,8 +347,15 @@ int ler_wav_multicanal(const char *arquivo, Channel channels[], TXACHeader *head
         return 0;
     }
 
+    size_t bytes_per_sample = header->bits_per_sample / 8;
+    size_t samples_per_channel =
+        bytes_per_sample && header->channels
+        ? (size_t)chunk_size / bytes_per_sample / header->channels
+        : 512 * 1024;
+    if (samples_per_channel == 0) samples_per_channel = 1;
+
     for (int i = 0; i < header->channels; i++) {
-        init_channel(&channels[i], 512 * 1024);
+        init_channel(&channels[i], samples_per_channel);
     }
 
     float fator_f = (float)pow(10.0, -DB_REDUCTION / 20.0);
@@ -368,26 +406,14 @@ int ler_wav_multicanal(const char *arquivo, Channel channels[], TXACHeader *head
 // COMPRESSÃO COM DELTA
 // ============================================================================
 
-void encode_rice_symbol(RiceBuffer *rb, uint8_t symbol, int k) {
-    uint32_t q = symbol >> k;          // Quociente
-    uint32_t r = symbol & ((1 << k) - 1); // Resto
-
-    // Escreve Quociente em Unário (q uns seguido de um zero)
-    for (uint32_t i = 0; i < q; i++) {
-        write_bits(rb, 1, 1);
-    }
-    write_bits(rb, 0, 1);
-
-    // Escreve Resto em Binário (k bits)
-    write_bits(rb, r, k);
-} 
-
 void *compactar_canal_4bit_thread(void *arg) {
     ThreadData *td = (ThreadData*)arg;
     Channel *ch = td->channel;
     Binary4BitBuffer *out = td->output;
     
     init_4bit_buffer(out);
+    RiceBuffer rice_out;
+    rice_writer_init(&rice_out, out);
     
     printf("  [Channel %d] Applying delta encoding...\n", td->channel_id);
     
@@ -402,12 +428,10 @@ void *compactar_canal_4bit_thread(void *arg) {
     
     printf("  [Channel %d] Compressing %zu deltas to 4-bit...\n", td->channel_id, delta_count);
     
-    char temp[128];
     size_t i = 0;
     
 while (i < delta_count) {
         int32_t atual = deltas[i];
-        char temp[128];
         
         // 1. Tenta repetição IMEDIATA (^)
         size_t count = 1;
@@ -416,14 +440,18 @@ while (i < delta_count) {
         }
 
         if (count >= 2) {
-            sprintf(temp, "%d^%zu,", atual, count);
-            write_string_4bit(out, temp);
+            rice_write_token(&rice_out, atual, '^', count);
             i += count;
             continue;
         }
 
         // 2. Tenta Sniper (~) com Look-ahead de 100 samples usando AVX2
         int sniper_found = 0;
+        if (!td->enable_loop_compression) {
+            rice_write_token(&rice_out, atual, '\0', 0);
+            i++;
+            continue;
+        }
         int janela = 100; // O "100 à frente" que você pediu
         int limite_busca = (i + janela < delta_count) ? i + janela : delta_count - 1;
 
@@ -446,13 +474,11 @@ while (i < delta_count) {
 
             if (!rep_no_caminho) {
                 // Aplica o Sniper: Valor~Distancia,
-                sprintf(temp, "%d~%d,", atual, dist - 1);
-                write_string_4bit(out, temp);
+                rice_write_token(&rice_out, atual, '~', (uint64_t)(dist - 1));
                 
                 // Escreve os valores que ficaram no meio
                 for (int j = i + 1; j < found_idx; j++) {
-                    sprintf(temp, "%d,", deltas[j]);
-                    write_string_4bit(out, temp);
+                    rice_write_token(&rice_out, deltas[j], '\0', 0);
                 }
                 
                 i = found_idx + 1; // Pula para depois do valor encontrado
@@ -462,42 +488,11 @@ while (i < delta_count) {
 
         // 3. Fallback: Se nada funcionou, escreve o valor simples
         if (!sniper_found) {
-            sprintf(temp, "%d,", atual);
-            write_string_4bit(out, temp);
+            rice_write_token(&rice_out, atual, '\0', 0);
             i++;
         }
     }
-        finalize_4bit_buffer(out);
-
-        // --- NOVA ETAPA: RICE ENCODING ---
-RiceBuffer rice_out;
-rice_out.capacity = out->byte_count; // Estimativa inicial
-rice_out.data = malloc(rice_out.capacity);
-rice_out.byte_count = 0;
-rice_out.bit_buffer = 0;
-rice_out.bit_count = 0;
-
-printf("  [Channel %d] Starting Rice Encoding step...\n", td->channel_id);
-
-for (size_t b = 0; b < out->byte_count; b++) {
-    // Pega os dois nibbles (símbolos de 4 bits) de volta
-    uint8_t high = out->data[b] >> 4;
-    uint8_t low = out->data[b] & 0x0F;
-
-    encode_rice_symbol(&rice_out, high, 1); // k=2 é um bom ponto de partida
-    encode_rice_symbol(&rice_out, low, 1);
-}
-
-// Finaliza o último byte se houver bits sobrando
-if (rice_out.bit_count > 0) {
-    rice_out.bit_buffer <<= (8 - rice_out.bit_count);
-    rice_out.data[rice_out.byte_count++] = rice_out.bit_buffer;
-}
-
-// Substitui o buffer de saída original pelo comprimido com Rice
-free(out->data);
-out->data = rice_out.data;
-out->byte_count = rice_out.byte_count;
+    rice_writer_finish(&rice_out);
     
     printf("  [Channel %d] Compressed: %zu bytes (4-bit delta + rice)\n", td->channel_id, out->byte_count);
     
@@ -606,7 +601,8 @@ int main(int argc, char **argv) {
 
     printf("\nChannel compression results:\n");
     for (int i = 0; i < header.channels; i++) {
-        printf("  Channel %d: %llu bytes\n", i, sizes[i]);
+        printf("  Channel %d: %llu bytes\n", i,
+               (unsigned long long)sizes[i]);
         free(channels[i].samples);
         free(outputs[i].data);
     }
